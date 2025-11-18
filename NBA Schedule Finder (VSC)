@@ -1,0 +1,47 @@
+# --- VS CODE SCRIPT: FETCH SCHEDULE LOCALLY ---
+import pandas as pd
+from datetime import datetime, timedelta
+from nba_api.stats.endpoints import scoreboardv2
+from nba_api.stats.library.http import NBAStatsHTTP
+
+# 1. Setup Headers (To look like a real browser)
+NBAStatsHTTP.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Referer': 'https://www.nba.com/',
+    'Origin': 'https://www.nba.com/',
+    'Accept-Language': 'en-US,en;q=0.9',
+})
+
+print("📅 SCANNING NEXT 5 DAYS FOR GAMES...")
+today = datetime.now()
+dates_to_check = [today + timedelta(days=i) for i in range(5)]
+found_games = []
+
+for date_obj in dates_to_check:
+    date_str = date_obj.strftime('%Y-%m-%d')
+    print(f"   > Checking {date_str}...", end=" ")
+    
+    try:
+        board = scoreboardv2.ScoreboardV2(game_date=date_str, timeout=10)
+        games_header = board.game_header.get_data_frame()
+        
+        if not games_header.empty:
+            print(f"✅ Found {len(games_header)} games.")
+            for _, game in games_header.iterrows():
+                found_games.append({
+                    'Date': date_str, # Save as string for CSV
+                    'Home_ID': game['HOME_TEAM_ID'],
+                    'Visitor_ID': game['VISITOR_TEAM_ID']
+                })
+        else:
+            print("No games.")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+if found_games:
+    df = pd.DataFrame(found_games)
+    df.to_csv('upcoming_games.csv', index=False)
+    print("\n✅ SUCCESS! Saved 'upcoming_games.csv'.")
+    print("👉 Now upload this file to your Google Colab.")
+else:
+    print("\n❌ No games found. (Are we in the off-season?)")
