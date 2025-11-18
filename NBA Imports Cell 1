@@ -1,0 +1,20 @@
+# --- FINAL ACTIVATION AND EXECUTION CELL ---
+import os
+import sys
+
+# 1. FORCE THE CORRECT PYTHON PATH
+# This tells the notebook where to find TensorFlow Quantum (in the py3.9 environment)
+try:
+    # Try to clean the path first
+    sys.path.remove('/usr/local/lib/python3.9/site-packages')
+except:
+    pass
+sys.path.append('/usr/local/envs/quantum_env/lib/python3.9/site-packages')
+
+# 2. Define script name and executable (assuming environment is installed)
+PYTHON_EXEC = '/usr/local/envs/quantum_env/bin/python'
+script_name = "run_live_bets_final.py"
+
+# 3. Final Execution
+print("✅ PATH SET. LAUNCHING PREDICTION SCRIPT...")
+os.system(f'{PYTHON_EXEC} {script_name}')
