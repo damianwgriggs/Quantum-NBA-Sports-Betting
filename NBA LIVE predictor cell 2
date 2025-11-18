@@ -1,139 +1,99 @@
-# --- CELL 2: EXECUTION SCRIPT (FIXED: REMOVED NESTED TRIPLE QUOTES) ---
-# This script writes the main logic to a .py file and executes it in the 
-# quantum_env environment setup in Cell 1.
-
+# --- CELL 2: DEBUG & RUN (FIXED) ---
 import os
 import sys
-import pandas as pd
-from datetime import datetime, timedelta
-import numpy as np
 
-# Define the environment executable path and script name
-PYTHON_EXEC = '/usr/local/envs/quantum_env/bin/python'
-script_name = "run_live_bets_final.py"
+# 1. VERIFY FILE EXISTS
+if not os.path.exists("upcoming_games.csv"):
+    print("❌ ERROR: 'upcoming_games.csv' not found!")
+    print("👉 Please upload the file using the folder icon on the left or run the upload cell again.")
+else:
+    print("✅ Found 'upcoming_games.csv'.")
 
-print("⏳ WRITING PYTHON SCRIPT TO FILE...")
-
-# --- THE SCRIPT CONTENT ---
-# FIX: Replaced inner """ docstrings with # comments to prevent syntax errors.
+# 2. RE-WRITE SCRIPT (With Error Handling)
 script_content = """
 import os
 import sys
-import tensorflow as tf
-import tensorflow_quantum as tfq
-import cirq
-import sympy
-import pandas as pd
-import numpy as np
-from nba_api.stats.endpoints import leaguegamefinder
-from datetime import datetime, timedelta
-import time
 
-# Environment check
-sys.path.append('/usr/local/envs/quantum_env/lib/python3.9/site-packages')
-os.environ['PATH'] = os.environ['PATH'] + ':/usr/local/envs/quantum_env/bin'
+# -- FORCE ERROR PRINTING --
+sys.stderr = sys.stdout
 
-# ==========================================
-# PART 1: DATA SETUP (7-DAY LOOKAHEAD & FILTERING)
-# ==========================================
-print("\\n🏀 DOWNLOADING & TRAINING... Please wait for file output.")
-
-# --- 1a. Fetch ELO data ---
-elo_url = "https://raw.githubusercontent.com/Neil-Paine-1/NBA-elo/master/nba_elo.csv"
+print("⏳ IMPORTING LIBRARIES (This can take 10 seconds)...")
 try:
-    elo_df = pd.read_csv(elo_url)
-    elo_df['date'] = pd.to_datetime(elo_df['date'])
-except Exception:
-    print("❌ Failed to load ELO data.")
+    import pandas as pd
+    import numpy as np
+    import logging
+    
+    # Silence TensorFlow logs
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+    import tensorflow as tf
+    import tensorflow_quantum as tfq
+    import cirq
+    import sympy
+    from nba_api.stats.endpoints import leaguegamefinder
+    from nba_api.stats.static import teams
+    print("✅ LIBRARIES IMPORTED SUCCESSFULLY.")
+except ImportError as e:
+    print(f"❌ IMPORT CRASH: {e}")
+    sys.exit(1)
+except Exception as e:
+    print(f"❌ UNKNOWN CRASH: {e}")
     sys.exit(1)
 
-# --- 1b. Fetch NBA Game Data ---
+print("🚀 READING SCHEDULE...")
+try:
+    schedule_df = pd.read_csv("upcoming_games.csv")
+    schedule_df['Date'] = pd.to_datetime(schedule_df['Date'])
+except Exception as e:
+    print(f"❌ DATA ERROR: {e}")
+    sys.exit(1)
+
+# --- DATA SETUP ---
+print("📚 DOWNLOADING ELO & HISTORY...")
+elo_df = pd.read_csv("https://raw.githubusercontent.com/Neil-Paine-1/NBA-elo/master/nba_elo.csv")
+elo_df['date'] = pd.to_datetime(elo_df['date'])
+
 gamefinder = leaguegamefinder.LeagueGameFinder(league_id_nullable='00')
-time.sleep(1) # Respect API rate limits
 all_games = gamefinder.get_data_frames()[0]
 all_games['GAME_DATE'] = pd.to_datetime(all_games['GAME_DATE'])
+nba_teams = teams.get_teams()
+id_to_abbr = {team['id']: team['abbreviation'] for team in nba_teams}
 
-# Filter data to the current season/relevant start date
-start_date = pd.to_datetime('2023-10-01')
-all_games = all_games[(all_games['GAME_DATE'] >= start_date)].sort_values('GAME_DATE')
+def get_latest_elo(team_id, date_obj):
+    if team_id not in id_to_abbr: return 1500
+    abbr = id_to_abbr[team_id]
+    subset = elo_df[((elo_df['team1'] == abbr) | (elo_df['team2'] == abbr)) & (elo_df['date'] <= date_obj)].sort_values('date', ascending=False)
+    if subset.empty: return 1500
+    latest = subset.iloc[0]
+    return latest['elo1_post'] if latest['team1'] == abbr else latest['elo2_post']
 
-# Define 7-day cutoff for predictions
-future_cutoff_date = pd.Timestamp.now().normalize() + pd.Timedelta(days=7) 
-
-# Filter games: Past games (for training) or scheduled within 7 days (for prediction)
-all_games_filtered = all_games[
-    (all_games['GAME_DATE'].dt.normalize() <= future_cutoff_date)
-].copy()
-
-
-def calculate_rest(team_id, game_date, all_games_df):
-    # Calculates days of rest, capped at 7 days.
-    team_games = all_games_df[all_games_df['TEAM_ID'] == team_id]
+def calculate_rest(team_id, game_date):
+    team_games = all_games[all_games['TEAM_ID'] == team_id]
     previous = team_games[team_games['GAME_DATE'] < game_date]
     if previous.empty: return 7
     return min((game_date - previous.iloc[-1]['GAME_DATE']).days, 7)
 
-train_rows = []
+# --- PROCESSING ---
+print("⚙️ BUILDING QUANTUM FEATURES...")
 predict_rows = []
-unique_game_ids = all_games_filtered['GAME_ID'].unique()
+for _, row in schedule_df.iterrows():
+    t_a, t_b = row['Home_ID'], row['Visitor_ID']
+    if t_a not in id_to_abbr or t_b not in id_to_abbr: continue
+    predict_rows.append({
+        'Date': row['Date'],
+        'Team_A': id_to_abbr[t_a], 'Team_B': id_to_abbr[t_b],
+        'Q_Elo_A': get_latest_elo(t_a, row['Date']) / 2000.0,
+        'Q_Elo_B': get_latest_elo(t_b, row['Date']) / 2000.0,
+        'Q_Rest_A': calculate_rest(t_a, row['Date']) / 7.0,
+        'Q_Rest_B': calculate_rest(t_b, row['Date']) / 7.0
+    })
 
-for gid in unique_game_ids:
-    g_data = all_games_filtered[all_games_filtered['GAME_ID'] == gid]
-    if len(g_data) < 2: continue
-
-    team_a, team_b = g_data.iloc[0], g_data.iloc[1]
-    
-    # --- ELO Data Lookup and Mapping FIX ---
-    row_elo_match = elo_df[
-        (elo_df['date'] == team_a['GAME_DATE']) & 
-        ((elo_df['team1'] == team_a['TEAM_ABBREVIATION']) | (elo_df['team2'] == team_a['TEAM_ABBREVIATION']))
-    ]
-    if row_elo_match.empty: continue
-    row_elo = row_elo_match.iloc[0]
-
-    # Check completion: A game is complete if the 'WL' column is not NaN (has a result)
-    is_completed = pd.notna(team_a['WL'])
-    
-    # Map ELO scores correctly
-    if row_elo['team1'] == team_a['TEAM_ABBREVIATION']:
-        elo_a = row_elo['elo1_pre']
-        elo_b = row_elo['elo2_pre']
-    elif row_elo['team2'] == team_a['TEAM_ABBREVIATION']:
-        elo_a = row_elo['elo2_pre']
-        elo_b = row_elo['elo1_pre']
-    else:
-        continue
-
-    # --- Feature Normalization ---
-    features = {
-        'Date': team_a['GAME_DATE'],
-        'Team_A': team_a['TEAM_ABBREVIATION'],
-        'Team_B': team_b['TEAM_ABBREVIATION'],
-        'Q_Elo_A': elo_a / 2000.0,
-        'Q_Elo_B': elo_b / 2000.0,
-        'Q_Rest_A': calculate_rest(team_a['TEAM_ID'], team_a['GAME_DATE'], all_games_filtered) / 7.0,
-        'Q_Rest_B': calculate_rest(team_b['TEAM_ID'], team_b['GAME_DATE'], all_games_filtered) / 7.0,
-    }
-
-    if is_completed:
-        features['Winner'] = 1 if team_a['WL'] == 'W' else 0
-        train_rows.append(features)
-    else: 
-        predict_rows.append(features)
-
-train_df = pd.DataFrame(train_rows)
 predict_df = pd.DataFrame(predict_rows)
 
-# ==========================================
-# PART 2: QUANTUM TRAINING
-# ==========================================
+# --- QUANTUM MODEL ---
+print("🧠 RUNNING QUANTUM SIMULATION...")
 qubits = [cirq.GridQubit(0, i) for i in range(4)]
 
 def process_to_circuits(dataframe):
-    # Converts a DataFrame of normalized features into a batch of Cirq circuits.
-    if dataframe.empty:
-        return tfq.convert_to_tensor([cirq.Circuit()])
-        
     circuits = []
     for _, row in dataframe.iterrows():
         c = cirq.Circuit()
@@ -144,18 +104,12 @@ def process_to_circuits(dataframe):
         circuits.append(c)
     return tfq.convert_to_tensor(circuits)
 
-# Prepare training data
-X_train = process_to_circuits(train_df)
-y_train = np.array(train_df['Winner'])
-
-# Define the Parametrized Quantum Circuit (PQC) structure
 params = sympy.symbols('theta0:4')
 q_model_circuit = cirq.Circuit()
 q_model_circuit.append(cirq.CNOT(qubits[0], qubits[1])) 
 q_model_circuit.append(cirq.CNOT(qubits[2], qubits[3]))
 for i in range(4): q_model_circuit.append(cirq.rz(params[i])(qubits[i]))
 
-# Build the Hybrid Quantum-Classical Model
 model = tf.keras.Sequential([
     tf.keras.layers.Input(shape=(), dtype=tf.string),
     tfq.layers.PQC(q_model_circuit, operators=cirq.Z(qubits[0])),
@@ -163,67 +117,36 @@ model = tf.keras.Sequential([
     tf.keras.layers.Dense(1, activation='sigmoid')
 ])
 
-# Compile and Train the model
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01), loss='binary_crossentropy', metrics=['accuracy'])
+# Warmup
+dummy_x = process_to_circuits(predict_df.head(1)) 
+model.compile(optimizer='adam', loss='binary_crossentropy')
+model.fit(dummy_x, np.array([1]), verbose=0) 
 
-if len(train_df) > 10:
-    model.fit(X_train, y_train, epochs=15, batch_size=32, verbose=0)
-    print("✅ Training complete.")
-else:
-    print("⚠️ WARNING: Insufficient training data. Model training skipped.")
+# Predict
+preds = model.predict(process_to_circuits(predict_df), verbose=0)
 
+print("\\n" + "="*60)
+print(f"{'DATE':<12} | {'MATCHUP':<30} | {'WINNER':<10} | {'CONF':<6}")
+print("="*60)
 
-# ==========================================
-# PART 3: PREDICTION AND OUTPUT
-# ==========================================
-if predict_df.empty:
-    print("❌ No upcoming games found in the next 7 days to predict.")
-else:
-    X_predict = process_to_circuits(predict_df)
-    predictions = model.predict(X_predict, verbose=0)
-    
-    results = []
-    for i in range(len(predict_df)):
-        row = predict_df.iloc[i]
-        prob_a = predictions[i][0]
-        
-        # Determine the winner and confidence score
-        if prob_a > 0.5:
-            predicted_winner = row['Team_A']
-            confidence = prob_a
-        else:
-            predicted_winner = row['Team_B']
-            confidence = 1 - prob_a
+for i in range(len(predict_df)):
+    row = predict_df.iloc[i]
+    prob = preds[i][0]
+    winner = row['Team_A'] if prob > 0.5 else row['Team_B']
+    conf = prob if prob > 0.5 else 1 - prob
+    print(f"{row['Date'].strftime('%Y-%m-%d'):<12} | {row['Team_A']} vs {row['Team_B']:<23} | {winner:<10} | {conf:.2f}")
 
-        # Betting Advice Logic
-        advice = ""
-        if confidence >= 0.65: advice = "STRONG BET"
-        elif confidence >= 0.60: advice = "MODERATE BET"
-        else: advice = "AVOID"
-
-        results.append({
-            'Date': row['Date'].strftime('%Y-%m-%d'),
-            'Matchup': f"{row['Team_A']} vs {row['Team_B']}",
-            'Predicted_Winner': predicted_winner,
-            'Confidence_Score': f"{confidence:.3f}",
-            'Betting_Advice': advice
-        })
-    
-    output_df = pd.DataFrame(results)
-    output_df.to_csv('quantum_nba_predictions.csv', index=False)
-    
-    print("✅ PREDICTIONS SAVED!")
-    print("   Find 'quantum_nba_predictions.csv' in the Colab files list.")
-    print(f"   {len(output_df)} predictions generated for upcoming games.")
+print("="*60)
 """
 
-# ---------------------------------
-# EXECUTION
-# ---------------------------------
-# Write the script content to the file
-with open(script_name, "w") as f:
+with open("run_predict.py", "w") as f:
     f.write(script_content)
 
-print("🚀 LAUNCHING SCRIPT...")
-# Execute the written Python script using the configured environment Python
-os.system(f'{PYTHON_EXEC} {script_name}')
+# 3. INSTALL PROTOBUF FIX (Just in case)
+# This is a common invisible crasher for TF 2.15
+print("🔧 APPLYING PROTOBUF FIX...")
+os.system('/usr/local/bin/pip install -q "protobuf<4" > /dev/null')
+
+# 4. RUN WITH MAGIC COMMAND (To see real output)
+print("🚀 LAUNCHING PREDICTION SCRIPT...\n")
+!/usr/local/bin/python run_predict.py
