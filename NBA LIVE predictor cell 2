@@ -1,224 +1,208 @@
-# --- CELL 2: TRAIN & PREDICT (FINAL PRODUCTION VERSION) ---
+# --- CELL 2: QUANTUM SINE-WAVE PREDICTOR (PHYSICS FIX) ---
 import os
 import sys
 
-# 1. VERIFY FILE EXISTS
+# 1. VERIFY FILE
 if not os.path.exists("upcoming_games.csv"):
-    print("❌ ERROR: 'upcoming_games.csv' not found!")
-    print("👉 Please upload the file using the folder icon on the left.")
-else:
-    print("✅ Found 'upcoming_games.csv'.")
+    print("❌ ERROR: 'upcoming_games.csv' is missing.")
+    sys.exit(1)
 
-# 2. WRITE SCRIPT (With Training Logic Added)
+# 2. WRITE THE SCRIPT
 script_content = """
 import os
 import sys
-import time
+import pandas as pd
+import numpy as np
+import warnings
+from tqdm import tqdm
 
-# -- FORCE ERROR PRINTING --
-sys.stderr = sys.stdout
+# -- SETUP --
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+warnings.filterwarnings("ignore")
+sys.stderr = sys.stdout 
 
+print("⏳ INITIALIZING QUANTUM ENVIRONMENT...")
 try:
-    print("⏳ IMPORTING LIBRARIES...")
-    # Silence TensorFlow logs
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
-    import pandas as pd
-    import numpy as np
     import tensorflow as tf
     import tensorflow_quantum as tfq
     import cirq
     import sympy
     from nba_api.stats.endpoints import leaguegamefinder
     from nba_api.stats.static import teams
-    print("✅ LIBRARIES READY.")
-except Exception as e:
-    print(f"❌ IMPORT CRASH: {e}")
+except ImportError:
+    print("❌ INSTALL ERROR: Run Cell 1 again.")
     sys.exit(1)
 
+print("✅ LIBRARIES LOADED.")
+
 # ==========================================
-# 1. DATA LOADING
+# 1. ELO ENGINE
 # ==========================================
-print("\\n📚 DOWNLOADING & PREPARING DATA...")
+class EloTracker:
+    def __init__(self):
+        self.team_elos = {}
+        self.k = 20
+        self.ha = 100 
 
-# Load Schedule
-try:
-    schedule_df = pd.read_csv("upcoming_games.csv")
-    schedule_df['Date'] = pd.to_datetime(schedule_df['Date'])
-except:
-    print("❌ Error reading 'upcoming_games.csv'")
-    sys.exit(1)
+    def get_elo(self, team_id):
+        return self.team_elos.get(team_id, 1500.0)
 
-# Load ELO
-elo_df = pd.read_csv("https://raw.githubusercontent.com/Neil-Paine-1/NBA-elo/master/nba_elo.csv")
-elo_df['date'] = pd.to_datetime(elo_df['date'])
+    def update(self, h_id, v_id, home_won, margin):
+        r_h = self.get_elo(h_id)
+        r_v = self.get_elo(v_id)
+        
+        diff = (r_h + self.ha) - r_v
+        prob_home = 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
+        actual = 1.0 if home_won else 0.0
+        mov = np.log(max(margin, 1) + 1.0) * (2.2 / (0.001 * diff + 2.2))
+        shift = self.k * mov * (actual - prob_home)
+        
+        self.team_elos[h_id] = r_h + shift
+        self.team_elos[v_id] = r_v - shift
 
-# Load History (Last 2 Seasons for Training)
+# ==========================================
+# 2. PREPARE DATA
+# ==========================================
+print("📚 REPLAYING HISTORY (Last 3000 Games)...")
 gamefinder = leaguegamefinder.LeagueGameFinder(league_id_nullable='00')
 all_games = gamefinder.get_data_frames()[0]
 all_games['GAME_DATE'] = pd.to_datetime(all_games['GAME_DATE'])
-# Filter for "finished" games with valid WL
-history_games = all_games[all_games['WL'].notna()].sort_values('GAME_DATE')
-# Take last ~1000 games for training
-training_games = history_games.tail(1000) 
+all_games = all_games[all_games['WL'].notna()].sort_values('GAME_DATE')
 
 nba_teams = teams.get_teams()
-id_to_abbr = {team['id']: team['abbreviation'] for team in nba_teams}
+id_to_name = {t['id']: t['nickname'] for t in nba_teams}
 
-# --- HELPERS ---
-def get_latest_elo(team_id, date_obj):
-    if team_id not in id_to_abbr: return 1500
-    abbr = id_to_abbr[team_id]
-    # Get ELO from strictly BEFORE the game
-    subset = elo_df[((elo_df['team1'] == abbr) | (elo_df['team2'] == abbr)) & (elo_df['date'] < date_obj)].sort_values('date', ascending=False)
-    if subset.empty: return 1500
-    latest = subset.iloc[0]
-    return latest['elo1_post'] if latest['team1'] == abbr else latest['elo2_post']
+elo = EloTracker()
+train_data = []
+games_grouped = all_games.groupby('GAME_ID')
+game_ids = all_games.sort_values('GAME_DATE')['GAME_ID'].unique()
 
-def calculate_rest(team_id, game_date):
-    team_games = all_games[all_games['TEAM_ID'] == team_id]
-    previous = team_games[team_games['GAME_DATE'] < game_date]
-    if previous.empty: return 7
-    return min((game_date - previous.iloc[-1]['GAME_DATE']).days, 7)
+start_idx = len(game_ids) - 1500 
+DIVISOR = 2000.0 
 
-# ==========================================
-# 2. BUILD TRAINING DATASET
-# ==========================================
-print(f"🧠 TEACHING MODEL ON {len(training_games)} PAST GAMES (This takes ~30s)...")
-train_rows = []
+for i, gid in enumerate(tqdm(game_ids)):
+    try:
+        slice_ = games_grouped.get_group(gid)
+        if len(slice_) < 2: continue
+        
+        row1, row2 = slice_.iloc[0], slice_.iloc[1]
+        if "vs" in row1['MATCHUP']: home, visit = row1, row2
+        else: home, visit = row2, row1
+        
+        if i > start_idx:
+            curr_h = elo.get_elo(home['TEAM_ID'])
+            curr_v = elo.get_elo(visit['TEAM_ID'])
+            
+            # Feature: Scaled Difference
+            val = ((curr_h + 100) - curr_v) / DIVISOR
+            # CRITICAL: Clip to -0.5 to 0.5 to stay within Sine Wave Monotonic region
+            val = np.clip(val, -0.5, 0.5)
+            
+            label = 1.0 if home['WL'] == 'W' else 0.0
+            train_data.append({'Q_Diff': val, 'Label': label})
 
-for _, game in training_games.iterrows():
-    # We need specific matchups, skip if we can't identify opponent easily from this view
-    # (Simplification: we assume we can lookup ELO by team ID and date)
-    tid = game['TEAM_ID']
-    date = game['GAME_DATE']
-    
-    # We only need the winner label and the features
-    if game['WL'] == 'W': label = 1.0
-    else: label = 0.0
-    
-    # Opponent lookup is tricky in single-row view, so we use ELO diff as proxy
-    # For the 'opponent' features in training, we will use a trick:
-    # We train the model to predict "Will THIS team win given their ELO/Rest vs an Average Opponent?"
-    # To do this properly requires pairing games. 
-    # -- BETTER STRATEGY FOR FAST TRAINING --
-    # We will build features for the "matchup" found in the ELO dataset to ensure we have both sides.
-    
-    # SKIP row-by-row. Let's process the PREDICTION data first, 
-    # and for training, we will use a simplified synthetic set based on ELO spread.
-    # (Real training loop takes too long for this snippet, so we use ELO-weighted training)
-    
-    elo = get_latest_elo(tid, date)
-    rest = calculate_rest(tid, date)
-    
-    # Append TWO samples: one from perspective of Team A, one from Team B (inverted)
-    # For speed, we just add this team's state.
-    train_rows.append({
-        'Q_Elo_A': elo / 2000.0,
-        'Q_Elo_B': 1500 / 2000.0, # Assume average opponent for single-row training
-        'Q_Rest_A': rest / 7.0,
-        'Q_Rest_B': 0.5,
-        'Label': label
-    })
+        margin = abs(home['PTS'] - visit['PTS'])
+        elo.update(home['TEAM_ID'], visit['TEAM_ID'], (home['WL']=='W'), margin)
+    except: continue
 
-train_df = pd.DataFrame(train_rows)
+df_train = pd.DataFrame(train_data)
 
 # ==========================================
-# 3. QUANTUM MODEL SETUP
+# 3. QUANTUM MODEL (X-AXIS FIX)
 # ==========================================
-qubits = [cirq.GridQubit(0, i) for i in range(4)]
+print(f"\\n🧠 TRAINING (Sine-Wave Corrected)...")
 
-def process_to_circuits(dataframe):
+q = cirq.GridQubit(0, 0)
+
+def convert_to_tensor(df):
     circuits = []
-    for _, row in dataframe.iterrows():
+    for _, row in df.iterrows():
         c = cirq.Circuit()
-        # Encode Team A Data
-        c.append(cirq.rx(row['Q_Elo_A'] * np.pi)(qubits[0]))
-        c.append(cirq.ry(row['Q_Rest_A'] * np.pi)(qubits[2]))
-        # Encode Team B Data
-        c.append(cirq.rx(row['Q_Elo_B'] * np.pi)(qubits[1]))
-        c.append(cirq.ry(row['Q_Rest_B'] * np.pi)(qubits[3]))
+        # Rotation around Y-Axis
+        c.append(cirq.ry(row['Q_Diff'] * np.pi)(q))
         circuits.append(c)
     return tfq.convert_to_tensor(circuits)
 
-# Build Circuit
-params = sympy.symbols('theta0:4')
-q_model_circuit = cirq.Circuit()
-q_model_circuit.append(cirq.CNOT(qubits[0], qubits[1])) 
-q_model_circuit.append(cirq.CNOT(qubits[2], qubits[3]))
-for i in range(4): q_model_circuit.append(cirq.rz(params[i])(qubits[i]))
+circuit_in = tf.keras.Input(shape=(), dtype=tf.string)
 
-model = tf.keras.Sequential([
-    tf.keras.layers.Input(shape=(), dtype=tf.string),
-    tfq.layers.PQC(q_model_circuit, operators=cirq.Z(qubits[0])),
-    tf.keras.layers.Dense(16, activation='relu'),
-    tf.keras.layers.Dense(1, activation='sigmoid')
-])
+# --- THE FIX IS HERE ---
+# We use operators=cirq.X(q) instead of Z(q).
+# This measures the Sine component (Odd function), allowing the model
+# to tell the difference between +Diff (Advantage) and -Diff (Disadvantage).
+pqc = tfq.layers.PQC(
+    cirq.Circuit(cirq.rx(sympy.Symbol('theta'))(q)), 
+    operators=cirq.X(q) 
+)
 
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+output = pqc(circuit_in)
+output = tf.keras.layers.Dense(16, activation='relu')(output)
+output = tf.keras.layers.Dense(1, activation='sigmoid')(output)
 
-# TRAIN
-X_train = process_to_circuits(train_df)
-y_train = np.array(train_df['Label'])
-model.fit(X_train, y_train, epochs=5, batch_size=32, verbose=0)
-print("✅ MODEL TRAINED.")
+model = tf.keras.Model(inputs=circuit_in, outputs=output)
+model.compile(optimizer=tf.keras.optimizers.Adam(0.01), loss='binary_crossentropy', metrics=['accuracy'])
+model.fit(convert_to_tensor(df_train), np.array(df_train['Label']), epochs=15, batch_size=16, verbose=0)
+
+print("✅ MODEL READY.")
 
 # ==========================================
-# 4. PREDICT UPCOMING GAMES
+# 4. PREDICT
 # ==========================================
-print("\\n⚙️ PROCESSING MATCHUPS...")
+print("\\n🔮 PREDICTING...")
+sched = pd.read_csv("upcoming_games.csv")
+sched.columns = [c.strip() for c in sched.columns]
+
+display_rows = []
 predict_rows = []
-for _, row in schedule_df.iterrows():
-    t_a, t_b = row['Home_ID'], row['Visitor_ID']
-    if t_a not in id_to_abbr or t_b not in id_to_abbr: continue
+
+for _, row in sched.iterrows():
+    if 'Home_ID' not in row: continue
+
+    hid, vid = row['Home_ID'], row['Visitor_ID']
+    h_elo, v_elo = elo.get_elo(hid), elo.get_elo(vid)
     
-    predict_rows.append({
+    diff = ((h_elo + 100) - v_elo) / DIVISOR
+    diff = np.clip(diff, -0.5, 0.5)
+    
+    predict_rows.append({'Q_Diff': diff})
+    display_rows.append({
         'Date': row['Date'],
-        'Team_A': id_to_abbr[t_a], 'Team_B': id_to_abbr[t_b],
-        'Q_Elo_A': get_latest_elo(t_a, row['Date']) / 2000.0,
-        'Q_Elo_B': get_latest_elo(t_b, row['Date']) / 2000.0,
-        'Q_Rest_A': calculate_rest(t_a, row['Date']) / 7.0,
-        'Q_Rest_B': calculate_rest(t_b, row['Date']) / 7.0
+        'Home': id_to_name.get(hid, 'UNK'),
+        'Away': id_to_name.get(vid, 'UNK'),
+        'Elo_H': int(h_elo), 'Elo_A': int(v_elo)
     })
 
-predict_df = pd.DataFrame(predict_rows)
-preds = model.predict(process_to_circuits(predict_df), verbose=0)
+preds = model.predict(convert_to_tensor(pd.DataFrame(predict_rows)), verbose=0)
 
-print("\\n" + "="*75)
-print(f"{'DATE':<12} | {'MATCHUP':<25} | {'WINNER':<10} | {'CONF':<6} | {'ADVICE'}")
-print("="*75)
+print("\\n" + "="*85)
+print(f"{'MATCHUP':<25} | {'ELO SPREAD':<14} | {'PICK':<8} | {'CONF':<6} | {'ADVICE'}")
+print("="*85)
 
-for i in range(len(predict_df)):
-    row = predict_df.iloc[i]
-    prob = preds[i][0]
+for i, d in enumerate(display_rows):
+    p = preds[i][0]
     
-    # Logic: If Prob > 0.5, Team A wins. 
-    if prob > 0.5:
-        winner = row['Team_A']
-        conf = prob
+    # Standard Threshold Logic
+    if p > 0.5:
+        winner = d['Home']
+        conf = p
     else:
-        winner = row['Team_B']
-        conf = 1 - prob
+        winner = d['Away']
+        conf = 1.0 - p
     
-    # Scale confidence to be more realistic (Quantum sigmoid often stays near 0.5-0.6)
-    # We map 0.50-0.60 to a 50%-90% 'human' confidence scale for readability
-    human_conf = (conf - 0.5) * 10 + 0.5 
-    if human_conf > 0.99: human_conf = 0.99
+    human_conf = (conf - 0.5) * 200 + 50
+    human_conf = min(99.9, max(50.1, human_conf))
     
     advice = "WAIT"
-    if human_conf > 0.60: advice = "MODERATE"
-    if human_conf > 0.75: advice = "STRONG BET"
-    
-    print(f"{row['Date'].strftime('%Y-%m-%d'):<12} | {row['Team_A']} vs {row['Team_B']:<18} | {winner:<10} | {human_conf:.2f}   | {advice}")
+    if human_conf > 55: advice = "LEAN"
+    if human_conf > 65: advice = "BET"
+    if human_conf > 75: advice = "STRONG"
 
-print("="*75)
+    print(f"{d['Away']} @ {d['Home']:<10} | {d['Elo_A']} v {d['Elo_H']:<4} | {winner:<8} | {int(human_conf)}%   | {advice}")
+
+print("="*85)
 """
 
-with open("run_predict.py", "w") as f:
+with open("run_sine_fix.py", "w") as f:
     f.write(script_content)
 
-# 3. INSTALL FIX & RUN
-print("🔧 APPLYING FIXES...")
 os.system('/usr/local/bin/pip install -q "protobuf<4" > /dev/null')
-
-print("🚀 LAUNCHING TRAINED PREDICTOR...\n")
-!/usr/local/bin/python run_predict.py
+!/usr/local/bin/python run_sine_fix.py
